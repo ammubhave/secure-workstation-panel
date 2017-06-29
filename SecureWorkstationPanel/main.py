@@ -1,17 +1,34 @@
-import random
+import Queue
 import signal
-import string
 import subprocess
 import sys
 import threading
 import urllib
 
+from PyQt4.QtCore import *
 from PyQt4.QtGui import *
 import Xlib.display
 import Xlib.X
 import xpybutil.ewmh as ewmh
 
 from ui_secureworkstationpanel import *
+
+
+class SetPromptWorker(QThread):
+    def __init__(self, q):
+        QThread.__init__(self)
+        self.q = q
+
+    def __del__(self):
+        self.wait()
+
+    def run(self):
+        while True:
+            message, clientsocket = self.q.get(True)
+            print(message, clientsocket)
+            self.emit(SIGNAL('setPrompt(QString, PyQt_PyObject)'),
+                      message, clientsocket)
+        self.terminate()
 
 
 class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
@@ -36,6 +53,30 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
         self._display = Xlib.display.Display()
         self._root = self._display.screen().root
 
+        self.set_prompt_q = Queue.Queue()
+        self.set_prompt_thread = SetPromptWorker(self.set_prompt_q)
+        self.connect(self.set_prompt_thread,
+                     SIGNAL('setPrompt(QString, PyQt_PyObject)'),
+                     self.set_prompt)
+        self.set_prompt_thread.start()
+
+    def set_prompt(self, message, clientsocket):
+        print(message)
+        self.message.setText(message)
+
+        def allow_clicked():
+            clientsocket.send('\x01')
+            clientsocket.close()
+            self.prompt.hide()
+
+        def deny_clicked():
+            clientsocket.send('\x00')
+            clientsocket.close()
+            self.prompt.hide()
+        self.allow_button.clicked.connect(allow_clicked)
+        self.deny_button.clicked.connect(deny_clicked)
+        self.prompt.show()
+
     def active_workspace_change_listen(self):
         self._root.change_attributes(event_mask=Xlib.X.PropertyChangeMask)
 
@@ -50,15 +91,6 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
                         self._root.get_full_property(
                             NET_CURRENT_DESKTOP,
                             Xlib.X.AnyPropertyType).value[0]
-
-                    # ewmh.request_wm_desktop_checked(self.winId(),
-                    #                                 workspace_id)
-                    # self._window.change_property(
-                    #     self._display.intern_atom('_NET_WM_DESKTOP'),
-                    #     self._display.intern_atom('CARDINAL'),
-                    #     32, [workspace_id], Xlib.X.PropModeReplace)
-                    # print(workspace_id)
-
                     if workspace_id == 0:
                         self.urlbar.setText('')
                     else:
@@ -66,8 +98,6 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
                         url = names[workspace_id].split('|', 1)[-1]
                         self.urlbar.setText(url)
                         print(names[workspace_id])
-                # else:
-                #    print(str(self._display.get_atom_name(event.atom)))
         thread = threading.Thread(target=_f)
         thread.start()
 
@@ -104,20 +134,41 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
                 self._display.intern_atom('_NET_WM_STRUT_PARTIAL'),
                 self._display.intern_atom('CARDINAL'),
                 32, [0, 0, 150, 0], Xlib.X.PropModeReplace)
-            # workspace_id = \
-            #     self._root.get_full_property(
-            #         self._display.intern_atom('_NET_CURRENT_DESKTOP'),
-            #         Xlib.X.AnyPropertyType).value[0]
-            # print(workspace_id)
-            # self._window.change_property(
-            #     self._display.intern_atom('_NET_WM_DESKTOP'),
-            #     self._display.intern_atom('CARDINAL'),
-            #     32, [workspace_id], Xlib.X.PropModeReplace)
             subprocess.call(["/usr/bin/xprop",
                              "-f", "_NET_WM_WINDOW_TYPE", "32a",
                              "-id", str(self.winId()),
                              "-set", "_NET_WM_WINDOW_TYPE",
                              "_NET_WM_WINDOW_TYPE_DOCK"])
+        thread = threading.Thread(target=_f)
+        thread.start()
+
+    def secure_workstation_netfilter_daemon_listen(self):
+        def _f():
+            import socket
+            HOST = 'localhost'
+            PORT = 10293
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((HOST, PORT))
+            s.listen(1)
+            while 1:
+                (clientsocket, address) = s.accept()
+                r = ''
+                while True:
+                    b = clientsocket.recv(1)
+                    if b == '\x00':
+                        break
+                    r += b
+
+                src_vm, dst = r.strip().split()
+
+                self.set_prompt_q.put(('Connection attempt to ' + dst +
+                                       ' from ' + src_vm,
+                                       clientsocket))
+
+                print(src_vm, r)
+                # clientsocket.send('\x01')
+                # clientsocket.close()
         thread = threading.Thread(target=_f)
         thread.start()
 
@@ -136,9 +187,7 @@ def main():
     panel.show()
     panel.reserve_space()
     panel.active_workspace_change_listen()
-
-    # thread = threading.Thread(target=listener)
-    # thread.start()
+    panel.secure_workstation_netfilter_daemon_listen()
 
     app.exec_()
 

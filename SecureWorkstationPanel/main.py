@@ -1,3 +1,4 @@
+import os.path
 import Queue
 import signal
 import subprocess
@@ -13,6 +14,8 @@ import xpybutil.ewmh as ewmh
 
 from ui_secureworkstationpanel import *
 
+import evdev
+from evdev import InputDevice, categorize, ecodes
 
 class SetPromptWorker(QThread):
     def __init__(self, q):
@@ -30,6 +33,19 @@ class SetPromptWorker(QThread):
                       message, clientsocket)
         self.terminate()
 
+class SetUrlWorker(QThread):
+    def __init__(self, q):
+        QThread.__init__(self)
+        self.q = q
+
+    def __del__(self):
+        self.wait()
+
+    def run(self):
+        while True:
+            url = self.q.get(True)
+            self.emit(SIGNAL('setUrl(QString)'), url)
+        self.terminate()
 
 class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
     def __init__(self):
@@ -41,13 +57,39 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
         self.setWindowFlags(self.windowFlags() |
                             QtCore.Qt.FramelessWindowHint |
                             QtCore.Qt.WindowStaysOnTopHint)
-
         self.prompt.hide()
-        self.urlbar.returnPressed.connect(self.urlbar_navigate)
 
         def change_button_clicked():
-            self.activateWindow()
-            self.urlbar.setFocus(True)
+            def _f():
+                dev = InputDevice('/dev/input/by-id/usb-Logitech_USB_Receiver-event-kbd')
+                scancodes = {
+                    0: None, 1: None, 2: u'1', 3: u'2', 4: u'3', 5: u'4', 6: u'5', 7: u'6', 8: u'7', 9: u'8',
+                    10: u'9', 11: u'0', 12: u'-', 13: u'=', 14: None, 15: None, 16: u'q', 17: u'w', 18: u'e', 19: u'r',
+                    20: u't', 21: u'y', 22: u'u', 23: u'i', 24: u'o', 25: u'p', 26: u'[', 27: u']', 28: None, 29: None,
+                    30: u'a', 31: u's', 32: u'd', 33: u'f', 34: u'g', 35: u'h', 36: u'j', 37: u'k', 38: u'l', 39: u';',
+                    40: u'"', 41: u'`', 42: None, 43: u'\\', 44: u'z', 45: u'x', 46: u'c', 47: u'v', 48: u'b', 49: u'n',
+                    50: u'm', 51: u',', 52: u'.', 53: u'/', 54: None, 56: None, 57: u' ', 100: None
+                }
+                dev.grab()
+                s = ''
+                for event in dev.read_loop():
+                    if event.type == ecodes.EV_KEY:
+                        data = categorize(event)
+                        if data.keystate == 1:
+                            key_lookup = scancodes.get(data.scancode, None)
+                            if key_lookup != None:
+                                s += key_lookup
+                            if data.scancode == 14 and len(s) > 0:
+                                s = s[:-1]
+                            self.set_url_q.put(s)
+                            if(data.scancode == 28):
+                                print(s)
+                                self.urlbar_navigate(s)
+                                break
+                dev.ungrab()
+                dev.close()
+            thread = threading.Thread(target=_f)
+            thread.start()
         self.change_button.clicked.connect(change_button_clicked)
 
         self._display = Xlib.display.Display()
@@ -59,6 +101,16 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
                      SIGNAL('setPrompt(QString, PyQt_PyObject)'),
                      self.set_prompt)
         self.set_prompt_thread.start()
+
+        self.set_url_q = Queue.Queue()
+        self.set_url_thread = SetUrlWorker(self.set_url_q)
+        self.connect(self.set_url_thread,
+                     SIGNAL('setUrl(QString)'),
+                     self.set_url)
+        self.set_url_thread.start()
+
+    def set_url(self, url):
+        self.urlbar.setText(url)
 
     def set_prompt(self, message, clientsocket):
         print(message)
@@ -75,6 +127,7 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
             self.prompt.hide()
         self.allow_button.clicked.connect(allow_clicked)
         self.deny_button.clicked.connect(deny_clicked)
+        self.urlbar.setFocusPolicy(Qt.StrongFocus)
         self.prompt.show()
 
     def active_workspace_change_listen(self):
@@ -101,13 +154,16 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
         thread = threading.Thread(target=_f)
         thread.start()
 
-    def urlbar_navigate(self):
+    def urlbar_navigate(self, url):
         names = ewmh.get_desktop_names().reply()[:-1]
         n = ewmh.get_number_of_desktops().reply() + 1
         ewmh.request_number_of_desktops_checked(n).check()
-        url = str(self.urlbar.text())
-        with open('/var/run/qubes/dispid') as f:
-            names.append("disp" + f.read() + "|" + url)
+
+        next_dispid = '1'
+        if os.path.exists('/var/run/qubes/dispid'):
+            with open('/var/run/qubes/dispid') as f:
+                next_dispid = f.read()
+        names.append("disp" + next_dispid + "|" + url)
         ewmh.set_desktop_names_checked(map(lambda x: x.encode('utf-8'),
                                            names + [""])).check()
         ewmh.request_current_desktop_checked(n - 1).check()
@@ -118,9 +174,9 @@ class SecureWorkstationPanel(Ui_SecureWorkstationPanel, QWidget):
                             "qubes.VMShell dom0 DEFAULT "
                             "red" % (urllib.quote(url.encode('utf8'))),
                             shell=True)
-        thread = threading.Thread(target=_navigate,
-                                  args=[str(self.urlbar.text())])
+        thread = threading.Thread(target=_navigate, args=[url])
         thread.start()
+
 
     def reserve_space(self):
         def _f():
@@ -186,8 +242,14 @@ def main():
 
     panel.show()
     panel.reserve_space()
-    panel.active_workspace_change_listen()
-    panel.secure_workstation_netfilter_daemon_listen()
+    #panel.active_workspace_change_listen()
+    #panel.secure_workstation_netfilter_daemon_listen()
+
+    #window = QX11EmbedWidget()
+    #window.resize(QtGui.QDesktopWidget().screenGeometry().width(), 200)
+    #panel.setParent(window)
+    #window.embedInto(18874413)
+    #window.show()
 
     app.exec_()
 

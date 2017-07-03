@@ -26,7 +26,10 @@ def main():
         #     window_type = 0
         # else:
         #     window_type = window_type[0]
-        if vmname == "not found." and window_type != [379]:
+        print(window_type, vmname)
+        if vmname == "not found." and window_type[0] != 379:
+            if window_type[0] == 372:
+                return
             w.move_to_workspace(screen.get_workspace(0))
             return
         vmname = vmname[1:-1]
